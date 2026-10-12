@@ -1,0 +1,32 @@
+make -C /lib/modules/$(uname -r)/build M=$PWD compile_commands.json
+
+Pour recompiler si j'ajoute un .c au module
+
+lspci -nn
+Pour afficher les identifiants numériques
+
+cat /sys/bus/pci/devices/0000:00:04.0/vendor
+# Affichera : 0x1234
+
+cat /sys/bus/pci/devices/0000:00:04.0/device
+# Affichera : 0x11e8
+
+The PCI ID Repository (Si j'ai les codes et que je veux savoir à quel appareil ça correspond)
+
+La carte QEMU EDU possède sa propre mémoire interne (une SRAM de 4 Ko) qui commence à l'adresse 0x40000.
+
+0x80 : Adresse physique de la RAM (64 bits, donc on écrit la partie basse en 0x80 et la partie haute en 0x84).
+
+0x88 : Adresse de la mémoire interne de la carte (ex: 0x40000).
+
+0x90 : Taille du transfert en octets (ex: 4096).
+
+0x98 : Le registre de commande.
+
+    La valeur 1 (Bit 0 à 1, Bit 1 à 0) = Démarrer le transfert de RAM vers Carte.
+
+    La valeur 3 (Bit 0 à 1, Bit 1 à 1) = Démarrer le transfert de Carte vers RAM.
+
+lspci -vvv ou setpci
+
+perl /usr/src/kernels/$(uname -r)/scripts/checkpatch.pl --no-tree -f pilote.c

@@ -1,0 +1,24 @@
+CompileFlags:
+  Remove:
+    - -mrecord-mcount
+    - -mpreferred-stack-boundary=*
+    - -mindirect-branch=*
+    - -mindirect-branch-register
+    - -mindirect-branch-cs-prefix
+    - -mfunction-return=*
+    - -fconserve-stack
+    - -fno-allow-store-data-races
+    - -fmin-function-alignment=*
+    - -fzero-init-padding-bits=*
+    - -fsanitize=bounds-strict
+    - -mskip-rax-setup
+    - -fno-ipa-sra
+    - -mharden-sls=*
+    - -fdiagnostics-show-context=*
+    - -fms-anonymous-structs
+    - -fstrict-flex-arrays=*
+    - -Wno-*
+    - -W*
+Diagnostics:
+  UnusedIncludes: Strict
+  MissingIncludes: None
