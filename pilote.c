@@ -13,6 +13,39 @@
 #define EDU_VENDOR_ID 0x1234
 #define EDU_DEVICE_ID 0x11e8
 
+#define EDU_REG_ID 0x00
+#define EDU_ID_VALUE 0x010000ed
+
+#define EDU_REG_LIVENESS 0x04 // It is a simple value inversion (~ C operator).
+
+#define EDU_REG_FACT 0x08 // write n, get n!
+
+#define EDU_REG_STATUS 0x20
+#define EDU_STATUS_IRQ_FACT 0x80
+
+// It contains values which raised the interrupt (see interrupt raise register below).
+#define EDU_REG_IRQ_STATUS 0x24
+#define EDU_IRQ_FACT 0x01
+#define EDU_IRQ_DMA 0x100
+
+// Clear an interrupt. The value will be cleared from the interrupt status register. (EDU_IRQ_STATUS)
+// This needs to be done from the ISR to stop generating interrupts.
+#define EDU_REG_IRQ_ACK 0x64
+
+#define EDU_REG_DMA_SRC 0x80 // Where to perform the DMA from.
+#define EDU_REG_DMA_DST 0x88 // Where to perform the DMA to.
+#define EDU_REG_DMA_CNT 0x90 // The size of the area to perform the DMA on.
+#define EDU_REG_DMA_CMD 0x98
+// Bitwise OR of:
+// - 0x01: start transfer
+// - 0x02: direction (0: from RAM to EDU, 1: from EDU to RAM)
+// - 0x04: raise interrupt 0x100 after finishing the DMA
+#define EDU_DMA_START 0x01
+#define EDU_DMA_TO_RAM 0x02
+#define EDU_DMA_IRQ 0x04
+
+#define EDU_DMA_BUF 0x40000
+
 // On déclare quel matériel ce pilote gère
 static const struct pci_device_id edu_pci_ids[] = {
 	{ PCI_DEVICE(EDU_VENDOR_ID, EDU_DEVICE_ID) },
@@ -43,25 +76,26 @@ static irqreturn_t edu_irq_handler(int irq, void *dev_id)
 	struct edu_dev *edu = dev_id;
 
 	// Pourquoi avons-nous été interrompus ?
-	status = ioread32(edu->mmio + 0x24);
+	status = ioread32(edu->mmio + EDU_IRQ_STATUS);
 
-	if (!(status & (0x01 | 0x100))) {
+	if (!(status & (EDU_IRQ_FACT | EDU_IRQ_DMA))) {
 		// Ce n'est pas le signal de fin de factorielle ou de fin DMA.
 		// (Les lignes IRQ sont souvent partagées avec d'autres cartes)
 		return IRQ_NONE;
 	}
 
 	// Lire le résultat de la factorielle
-	if (status & 0x01) {
-		result = ioread32(edu->mmio + 0x08);
+	if (status & EDU_IRQ_FACT) {
+		result = ioread32(edu->mmio + EDU_FACT);
 		pr_alert("EDU IRQ: Résultat de la factorielle = %u\n", result);
 	}
 
-	if (status & 0x100)
+	// Donner le signal que le transfert de donnée DMA est fini.
+	if (status & EDU_IRQ_DMA)
 		complete(&edu->dma_done);
 
 	// Acquitter (éteindre) l'interruption
-	iowrite32(status, edu->mmio + 0x64);
+	iowrite32(status, edu->mmio + EDU_IRQ_ACK);
 
 	return IRQ_HANDLED; // On dit au noyau qu'on a bien géré le signal
 }
@@ -70,15 +104,13 @@ static int edu_dma(struct edu_dev *edu, dma_addr_t src, dma_addr_t dst,
 		   u32 count, u32 cmd)
 {
 	reinit_completion(&edu->dma_done);
-	// lower_32_bits et upper_32_bits sont des macros du noyau pour couper
-	// l'adresse 64 bits en deux
-	iowrite32(lower_32_bits(src), edu->mmio + 0x80);
-	iowrite32(upper_32_bits(src), edu->mmio + 0x84);
-	iowrite32(lower_32_bits(dst), edu->mmio + 0x88);
-	iowrite32(upper_32_bits(dst), edu->mmio + 0x8c);
-	iowrite32(count, edu->mmio + 0x90);
+	// Registre de 64 bits, partie haute nul grâce au dma_set_mask
+	iowrite32(lower_32_bits(src), edu->mmio + EDU_DMA_SRC);
+	iowrite32(lower_32_bits(dst), edu->mmio + EDU_DMA_DST);
+
+	iowrite32(count, edu->mmio + EDU_DMA_CNT);
 	// Lance le transfert (sens et IRQ fixés par cmd)
-	iowrite32(cmd, edu->mmio + 0x98);
+	iowrite32(cmd, edu->mmio + EDU_DMA_CMD);
 	if (!wait_for_completion_timeout(&edu->dma_done,
 					 msecs_to_jiffies(1000)))
 		return -ETIMEDOUT;
@@ -164,8 +196,8 @@ static int edu_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	}
 
 	// On lit 32 bits à l'offset 0 de notre pointeur virtuel
-	magic_value = ioread32(edu->mmio + 0x00);
-	if (magic_value != 0x010000ed) {
+	magic_value = ioread32(edu->mmio + EDU_ID_OFFSET);
+	if (magic_value != EDU_ID_VALUE) {
 		err = -ENODEV;
 		goto err_magic;
 	}
@@ -175,10 +207,10 @@ static int edu_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	pr_info("EDU: Envoi de la valeur 0x%08x à la carte...\n", test_val);
 
 	// On écrit à l'offset 0x04
-	iowrite32(test_val, edu->mmio + 0x04);
+	iowrite32(test_val, edu->mmio + EDU_LIVENESS);
 
 	// On relit immédiatement à ce même offset
-	inverted_val = ioread32(edu->mmio + 0x04);
+	inverted_val = ioread32(edu->mmio + EDU_LIVENESS);
 
 	pr_alert("EDU: La carte a répondu avec l'inversion : 0x%08x\n",
 		 inverted_val);
@@ -190,11 +222,11 @@ static int edu_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	pr_alert("EDU: Armement de l'alarme IRQ pour la factorielle...\n");
 	// On met le bit 7 à '1' dans le registre d'état (0x20) sinon le calcul se
 	// lance silencieusement et ne renvoie rien
-	iowrite32(0x80, edu->mmio + 0x20);
+	iowrite32(EDU_STATUS_IRQ_FACT, edu->mmio + EDU_STATUS);
 
-	pr_alert("EDU: Lancement du calcul de 10! (10 factorielle)...\n");
+	pr_alert("EDU: Lancement du calcul de 10!...\n");
 	// Le processeur écrit 10 puis continue sa vie. L'interruption fera le reste
-	iowrite32(10, edu->mmio + 0x08);
+	iowrite32(10, edu->mmio + EDU_FACT);
 
 	// LE GRAND FINAL : TRANSFERT DMA
 	// On écrit un message secret dans la RAM source (vaddr_from)
@@ -204,13 +236,14 @@ static int edu_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	pr_alert("EDU DMA: Dest AVANT le transfert = '%s'\n",
 		 (char *)edu->vaddr_to);
 
-	err = edu_dma(edu, edu->dma_handle_from, 0x40000, 4096,
-		      0x5); /* RAM → EDU */
+	err = edu_dma(edu, edu->dma_handle_from, EDU_DMA_BUF, 4096,
+		      EDU_DMA_START | EDU_DMA_IRQ); /* RAM → EDU */
 	if (err)
 		goto err_magic;
 
-	err = edu_dma(edu, 0x40000, edu->dma_handle_to, 4096,
-		      0x7); /* EDU → RAM */
+	err = edu_dma(edu, EDU_DMA_BUF, edu->dma_handle_to, 4096,
+		      EDU_DMA_START | EDU_DMA_TO_RAM |
+			      EDU_DMA_IRQ); /* EDU → RAM */
 	if (err)
 		goto err_magic;
 

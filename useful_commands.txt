@@ -30,3 +30,9 @@ La carte QEMU EDU possède sa propre mémoire interne (une SRAM de 4 Ko) qui com
 lspci -vvv ou setpci
 
 perl /usr/src/kernels/$(uname -r)/scripts/checkpatch.pl --no-tree -f pilote.c
+
+lspci -k pour voir le nom
+
+grep edu /proc/iomem voir la BAR réservée par pci_request_region
+
+https://www.qemu.org/docs/master/specs/edu.html
