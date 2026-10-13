@@ -9,6 +9,7 @@
 #include <linux/pci.h>
 #include <linux/printk.h>
 
+#define EDU_BAR 0
 // Valeurs déduite via le log "edu détecté: 0000:00:04.0", puis lspci -nn
 #define EDU_VENDOR_ID 0x1234
 #define EDU_DEVICE_ID 0x11e8
@@ -179,7 +180,7 @@ static int edu_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	// Mapping virtuel du BAR 0 (qui contient les registres de la carte EDU)
 	// Le 0 correspond au numéro du BAR (BAR 0), le deuxième 0 indique qu'on
 	// mappe toute sa taille
-	edu->mmio = pci_iomap(dev, 0, 0);
+	edu->mmio = pci_iomap(dev, EDU_BAR, 0);
 	if (!edu->mmio) {
 		err = -ENOMEM;
 		goto err_iomap;
