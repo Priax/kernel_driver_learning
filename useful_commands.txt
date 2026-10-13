@@ -15,17 +15,13 @@ The PCI ID Repository (Si j'ai les codes et que je veux savoir à quel appareil 
 
 La carte QEMU EDU possède sa propre mémoire interne (une SRAM de 4 Ko) qui commence à l'adresse 0x40000.
 
-0x80 : Adresse physique de la RAM (64 bits, donc on écrit la partie basse en 0x80 et la partie haute en 0x84).
-
-0x88 : Adresse de la mémoire interne de la carte (ex: 0x40000).
-
-0x90 : Taille du transfert en octets (ex: 4096).
-
-0x98 : Le registre de commande.
-
-    La valeur 1 (Bit 0 à 1, Bit 1 à 0) = Démarrer le transfert de RAM vers Carte.
-
-    La valeur 3 (Bit 0 à 1, Bit 1 à 1) = Démarrer le transfert de Carte vers RAM.
+0x80 : adresse source du DMA (64 bits ; edu ignore la partie haute en 0x84)
+0x88 : adresse destination du DMA (64 bits)
+       → l'une est l'adresse DMA du buffer en RAM, l'autre 0x40000 (buffer interne)
+0x90 : taille du transfert en octets
+0x98 : commande, OU des bits :
+       0x01 démarrer, 0x02 sens EDU → RAM, 0x04 IRQ en fin de transfert
+       ex. 0x5 = RAM → EDU avec IRQ, 0x7 = EDU → RAM avec IRQ
 
 lspci -vvv ou setpci
 
@@ -34,6 +30,12 @@ perl /usr/src/kernels/$(uname -r)/scripts/checkpatch.pl --no-tree -f pilote.c
 lspci -k pour voir le nom
 
 grep edu /proc/iomem voir la BAR réservée par pci_request_region
+
+Sur des registres plus riches, les champs de plusieurs bits sont courants, par exemple « bits 4 à 7: taille de rafale ». On les manipule avec <linux/bitfield.h>
+#define XYZ_CTRL_BURST  GENMASK(7, 4)
+
+Ce qu'il reste à faire:
+- le char device /dev/edu et l'ioctl.
 
 SOURCES:
 
