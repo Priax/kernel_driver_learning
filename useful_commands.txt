@@ -35,4 +35,7 @@ lspci -k pour voir le nom
 
 grep edu /proc/iomem voir la BAR réservée par pci_request_region
 
-https://www.qemu.org/docs/master/specs/edu.html
+SOURCES:
+
+- https://www.qemu.org/docs/master/specs/edu.html
+- https://docs.kernel.org/PCI/pci.html
