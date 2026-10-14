@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/completion.h>
-#include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
-#include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/printk.h>
+#include <linux/iopoll.h>
 
 #define EDU_BAR 0
 // Valeurs déduite via le log "edu détecté: 0000:00:04.0", puis lspci -nn
@@ -101,20 +100,39 @@ static irqreturn_t edu_irq_handler(int irq, void *dev_id)
 	return IRQ_HANDLED; // On dit au noyau qu'on a bien géré le signal
 }
 
+// Coupe les sources d'interruption de la carte et acquitte celles en attente,
+// pour qu'aucune IRQ n'arrive une fois le handler retiré
+static void edu_hw_stop(struct edu_dev *edu)
+{
+	iowrite32(0, edu->mmio + EDU_REG_STATUS);
+	iowrite32(ioread32(edu->mmio + EDU_REG_IRQ_STATUS),
+		  edu->mmio + EDU_REG_IRQ_ACK);
+}
+
 static int edu_dma(struct edu_dev *edu, dma_addr_t src, dma_addr_t dst,
 		   u32 count, u32 cmd)
 {
 	reinit_completion(&edu->dma_done);
-	// Registre de 64 bits, partie haute nul grâce au dma_set_mask
+	// Registres de 64 bits: on écrit les deux moitiés pour ne pas dépendre
+	// de ce qui a pu y être laissé avant
 	iowrite32(lower_32_bits(src), edu->mmio + EDU_REG_DMA_SRC);
+	iowrite32(upper_32_bits(src), edu->mmio + EDU_REG_DMA_SRC + 4);
 	iowrite32(lower_32_bits(dst), edu->mmio + EDU_REG_DMA_DST);
+	iowrite32(upper_32_bits(dst), edu->mmio + EDU_REG_DMA_DST + 4);
 
 	iowrite32(count, edu->mmio + EDU_REG_DMA_CNT);
 	// Lance le transfert (sens et IRQ fixés par cmd)
 	iowrite32(cmd, edu->mmio + EDU_REG_DMA_CMD);
 	if (!wait_for_completion_timeout(&edu->dma_done,
-					 msecs_to_jiffies(1000)))
+					 msecs_to_jiffies(1000))) {
+		u32 val;
+
+		// IRQ jamais reçue: on attend quand même que la carte ait fini,
+		// sinon elle lèverait son IRQ DMA après notre nettoyage
+		read_poll_timeout(ioread32, val, !(val & EDU_DMA_START), 1000,
+				  1000000, false, edu->mmio + EDU_REG_DMA_CMD);
 		return -ETIMEDOUT;
+	}
 
 	return 0;
 }
@@ -213,7 +231,7 @@ static int edu_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	// On relit immédiatement à ce même offset
 	inverted_val = ioread32(edu->mmio + EDU_REG_LIVENESS);
 
-	pr_alert("EDU: La carte a répondu avec l'inversion : 0x%08x\n",
+	pr_alert("EDU: La carte a répondu avec l'inversion: 0x%08x\n",
 		 inverted_val);
 
 	// Vérification mathématique (~ est l'opérateur C pour le NOT bit à bit)
@@ -229,7 +247,7 @@ static int edu_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	// Le processeur écrit 10 puis continue sa vie. L'interruption fera le reste
 	iowrite32(10, edu->mmio + EDU_REG_FACT);
 
-	// LE GRAND FINAL : TRANSFERT DMA
+	// LE GRAND FINAL: TRANSFERT DMA
 	// On écrit un message secret dans la RAM source (vaddr_from)
 	snprintf((char *)edu->vaddr_from, 4096, "Hellooooo !!!!!");
 
@@ -254,7 +272,9 @@ static int edu_probe(struct pci_dev *dev, const struct pci_device_id *id)
 
 	return 0; // Retourner 0 signifie que l'initialisation a réussi
 err_magic:
+	edu_hw_stop(edu);
 	free_irq(dev->irq, edu);
+	pci_clear_master(dev);
 err_irq:
 	pci_iounmap(dev, edu->mmio);
 err_iomap:
@@ -276,7 +296,9 @@ static void edu_remove(struct pci_dev *dev)
 
 	pr_alert("Désactivation du périphérique QEMU EDU.\n");
 
+	edu_hw_stop(edu);
 	free_irq(dev->irq, edu);
+	pci_clear_master(dev);
 	pci_iounmap(dev, edu->mmio); // Détruit le pointeur virtuel
 	pci_release_regions(dev); // Retire le panneau "Propriété privée"
 	dma_free_coherent(&dev->dev, 4096, edu->vaddr_to, edu->dma_handle_to);
