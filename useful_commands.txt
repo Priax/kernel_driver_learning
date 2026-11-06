@@ -34,6 +34,15 @@ grep edu /proc/iomem voir la BAR réservée par pci_request_region
 Sur des registres plus riches, les champs de plusieurs bits sont courants, par exemple « bits 4 à 7: taille de rafale ». On les manipule avec <linux/bitfield.h>
 #define XYZ_CTRL_BURST  GENMASK(7, 4)
 
+cat /proc/interrupts | grep edu     # après un probe raté ou un rmmod : la ligne doit avoir disparu
+cat /proc/iomem | grep edu          # les régions du BAR doivent avoir été libérées
+lspci -vv -s 00:04.0 | grep -i busmaster   # BusMaster- après remove
+
+for i in $(seq 50); do
+  echo 0000:00:04.0 > /sys/bus/pci/drivers/qemu_edu_driver/unbind
+  echo 0000:00:04.0 > /sys/bus/pci/drivers/qemu_edu_driver/bind
+done
+
 Ce qu'il reste à faire:
 - le char device /dev/edu et l'ioctl.
 
@@ -41,3 +50,10 @@ SOURCES:
 
 - https://www.qemu.org/docs/master/specs/edu.html
 - https://docs.kernel.org/PCI/pci.html
+
+sparse récent (celui de Fedora, 0.6.4, est trop vieux pour le noyau 7.x) :
+git clone https://git.kernel.org/pub/scm/devel/sparse/sparse.git ~/src/sparse
+make -C ~/src/sparse && make -C ~/src/sparse PREFIX=$HOME/.local install
+(puis sudo dnf remove sparse, ou vérifier que ~/.local/bin passe avant /usr/bin dans le PATH)
+
+make test VERBOSE=1 pour voir tous les messages du pilote pendant les tests

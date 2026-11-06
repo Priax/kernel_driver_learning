@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef EDU_IOCTL_H
 #include <linux/types.h>
 #define EDU_IOC_MAGIC 'E'

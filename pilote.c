@@ -2,11 +2,11 @@
 #include <linux/completion.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
+#include <linux/iopoll.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/printk.h>
-#include <linux/iopoll.h>
 
 #define EDU_BAR 0
 // Valeurs déduite via le log "edu détecté: 0000:00:04.0", puis lspci -nn
@@ -28,7 +28,8 @@
 #define EDU_IRQ_FACT 0x01
 #define EDU_IRQ_DMA 0x100
 
-// Clear an interrupt. The value will be cleared from the interrupt status register. (EDU_IRQ_STATUS)
+// Clear an interrupt. The value will be cleared
+// from the interrupt status register. (EDU_IRQ_STATUS)
 // This needs to be done from the ISR to stop generating interrupts.
 #define EDU_REG_IRQ_ACK 0x64
 
@@ -57,6 +58,7 @@ MODULE_DEVICE_TABLE(pci, edu_pci_ids);
 
 struct edu_dev {
 	void __iomem *mmio;
+	struct device *dev;
 
 	struct completion dma_done;
 
@@ -87,7 +89,8 @@ static irqreturn_t edu_irq_handler(int irq, void *dev_id)
 	// Lire le résultat de la factorielle
 	if (status & EDU_IRQ_FACT) {
 		result = ioread32(edu->mmio + EDU_REG_FACT);
-		pr_alert("EDU IRQ: Résultat de la factorielle = %u\n", result);
+		dev_info(edu->dev, "IRQ: Résultat de la factorielle = %u\n",
+			 result);
 	}
 
 	// Donner le signal que le transfert de donnée DMA est fini.
@@ -107,6 +110,11 @@ static void edu_hw_stop(struct edu_dev *edu)
 	iowrite32(0, edu->mmio + EDU_REG_STATUS);
 	iowrite32(ioread32(edu->mmio + EDU_REG_IRQ_STATUS),
 		  edu->mmio + EDU_REG_IRQ_ACK);
+}
+
+static void edu_hw_stop_action(void *data)
+{
+	edu_hw_stop(data);
 }
 
 static int edu_dma(struct edu_dev *edu, dma_addr_t src, dma_addr_t dst,
@@ -129,101 +137,98 @@ static int edu_dma(struct edu_dev *edu, dma_addr_t src, dma_addr_t dst,
 
 		// IRQ jamais reçue: on attend quand même que la carte ait fini,
 		// sinon elle lèverait son IRQ DMA après notre nettoyage
-		read_poll_timeout(ioread32, val, !(val & EDU_DMA_START), 1000,
-				  1000000, false, edu->mmio + EDU_REG_DMA_CMD);
+		if (read_poll_timeout(ioread32, val, !(val & EDU_DMA_START),
+				      1000, 1000000, false,
+				      edu->mmio + EDU_REG_DMA_CMD)) {
+			dev_err(edu->dev,
+				"DMA toujours en cours, la carte semble bloquée\n");
+		}
 		return -ETIMEDOUT;
 	}
 
 	return 0;
 }
 
-static int edu_probe(struct pci_dev *dev, const struct pci_device_id *id)
+static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	u32 magic_value;
-	u32 test_val = 0x00000043;
+	u32 test_val = 0x00000067;
 	u32 inverted_val;
 	int err;
+	int irq;
+	struct device *dev = &pdev->dev;
 	struct edu_dev *edu;
 
-	pr_alert("Périphérique QEMU EDU détecté !\n");
+	dev_info(dev, "Périphérique QEMU EDU détecté !\n");
 
-	edu = devm_kzalloc(&dev->dev, sizeof(*edu), GFP_KERNEL);
+	edu = devm_kzalloc(dev, sizeof(*edu), GFP_KERNEL);
 	if (!edu)
 		return -ENOMEM;
+	edu->dev = dev;
 
 	init_completion(&edu->dma_done);
-	pci_set_drvdata(dev, edu);
+	pci_set_drvdata(pdev, edu);
 
 	// Activation du périphérique (réveille le matériel et lui alloue ses
 	// ressources)
-	err = pci_enable_device(dev);
-	if (err) {
-		pr_err("Erreur lors de l'activation du périphérique PCI\n");
-		return err;
-	}
+	err = pcim_enable_device(pdev);
+	if (err)
+		return dev_err_probe(dev, err, "Activation PCI impossible\n");
 
 	// Autoriser la carte à faire du DMA (Bus Mastering)
-	pci_set_master(dev);
+	pci_set_master(pdev);
 
-	err = dma_set_mask_and_coherent(&dev->dev, DMA_BIT_MASK(28));
+	err = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(28));
 	if (err)
-		goto err_alloc_from;
+		return err;
 
 	// Allocation de 4096 octets (4 Ko) en RAM pour la source
-	edu->vaddr_from = dma_alloc_coherent(&dev->dev, 4096,
-					     &edu->dma_handle_from, GFP_KERNEL);
-	if (!edu->vaddr_from) {
-		err = -ENOMEM;
-		goto err_alloc_from;
-	}
+	edu->vaddr_from = dmam_alloc_coherent(dev, 4096, &edu->dma_handle_from,
+					      GFP_KERNEL);
+	if (!edu->vaddr_from)
+		return -ENOMEM;
 
 	// Allocation de 4096 octets pour la destination
-	edu->vaddr_to = dma_alloc_coherent(&dev->dev, 4096, &edu->dma_handle_to,
-					   GFP_KERNEL);
-	if (!edu->vaddr_to) {
-		err = -ENOMEM;
-		goto err_alloc_to;
-	}
+	edu->vaddr_to =
+		dmam_alloc_coherent(dev, 4096, &edu->dma_handle_to, GFP_KERNEL);
+	if (!edu->vaddr_to)
+		return -ENOMEM;
 
-	pr_info("EDU DMA: vaddr_from = %p, dma_handle_from = %llx\n",
-		edu->vaddr_from, (unsigned long long)edu->dma_handle_from);
-	pr_info("EDU DMA: vaddr_to = %p, dma_handle_to = %llx\n", edu->vaddr_to,
-		(unsigned long long)edu->dma_handle_to);
+	dev_info(dev, "DMA: vaddr_from = %p, dma_handle_from = %llx\n",
+		 edu->vaddr_from, (unsigned long long)edu->dma_handle_from);
 
-	// Réservation exclusive de toutes les adresses (BARs) de la carte
-	err = pci_request_regions(dev, "qemu_edu_driver");
+	dev_info(dev, "DMA: vaddr_to = %p, dma_handle_to = %llx\n",
+		 edu->vaddr_to, (unsigned long long)edu->dma_handle_to);
+
+	// Réserve le BAR 0 (les registres de la carte) et le mappe en mémoire
+	// virtuelle, libéré automatiquement
+	edu->mmio = pcim_iomap_region(pdev, EDU_BAR, "qemu_edu_driver");
+	if (IS_ERR(edu->mmio))
+		return PTR_ERR(edu->mmio);
+
+	// Edu only has one irq vector
+	err = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI | PCI_IRQ_INTX);
+	if (err < 0)
+		return dev_err_probe(dev, err, "aucun vecteur d'IRQ\n");
+
+	irq = pci_irq_vector(pdev, 0);
+	err = devm_request_irq(dev, irq, edu_irq_handler, IRQF_SHARED,
+			       "qemu_edu_driver", edu);
 	if (err)
-		goto err_regions;
+		return dev_err_probe(dev, err, "IRQ %d indisponible\n", irq);
 
-	// Mapping virtuel du BAR 0 (qui contient les registres de la carte EDU)
-	// Le 0 correspond au numéro du BAR (BAR 0), le deuxième 0 indique qu'on
-	// mappe toute sa taille
-	edu->mmio = pci_iomap(dev, EDU_BAR, 0);
-	if (!edu->mmio) {
-		err = -ENOMEM;
-		goto err_iomap;
-	}
-
-	// On s'abonne à la ligne d'interruption (dev->irq)
-	// IRQF_SHARED indique qu'on accepte de partager cette ligne avec d'autres
-	// périphériques
-	err = request_irq(dev->irq, edu_irq_handler, IRQF_SHARED,
-			  "qemu_edu_driver", edu);
-	if (err) {
-		pr_err("EDU: Impossible de demander l'IRQ %d\n", dev->irq);
-		goto err_irq;
-	}
+	err = devm_add_action_or_reset(dev, edu_hw_stop_action, edu);
+	if (err)
+		return err;
 
 	// On lit 32 bits à l'offset 0 de notre pointeur virtuel
 	magic_value = ioread32(edu->mmio + EDU_REG_ID);
-	if (magic_value != EDU_ID_VALUE) {
-		err = -ENODEV;
-		goto err_magic;
-	}
-	pr_alert("EDU: Valeur magique lue = 0x%08x\n", magic_value);
+	if (magic_value != EDU_ID_VALUE)
+		return -ENODEV;
+	dev_info(dev, "Valeur magique lue = 0x%08x\n", magic_value);
 
 	// ÉCRITURE DANS LA MÉMOIRE (Test d'inversion matérielle)
-	pr_info("EDU: Envoi de la valeur 0x%08x à la carte...\n", test_val);
+	dev_info(dev, "Envoi de la valeur 0x%08x à la carte...\n", test_val);
 
 	// On écrit à l'offset 0x04
 	iowrite32(test_val, edu->mmio + EDU_REG_LIVENESS);
@@ -231,80 +236,48 @@ static int edu_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	// On relit immédiatement à ce même offset
 	inverted_val = ioread32(edu->mmio + EDU_REG_LIVENESS);
 
-	pr_alert("EDU: La carte a répondu avec l'inversion: 0x%08x\n",
+	dev_info(dev, "La carte a répondu avec l'inversion: 0x%08x\n",
 		 inverted_val);
 
 	// Vérification mathématique (~ est l'opérateur C pour le NOT bit à bit)
 	if (inverted_val == ~test_val)
-		pr_alert("EDU: Le calcul matériel est correct !\n");
+		dev_info(dev, "Le calcul matériel est correct !\n");
 
-	pr_alert("EDU: Armement de l'alarme IRQ pour la factorielle...\n");
+	dev_info(dev, "Armement de l'alarme IRQ pour la factorielle...\n");
 	// On met le bit 7 à '1' dans le registre d'état (0x20) sinon le calcul se
 	// lance silencieusement et ne renvoie rien
 	iowrite32(EDU_STATUS_IRQ_FACT, edu->mmio + EDU_REG_STATUS);
 
-	pr_alert("EDU: Lancement du calcul de 10!...\n");
+	dev_info(dev, "Lancement du calcul de 10!...\n");
 	// Le processeur écrit 10 puis continue sa vie. L'interruption fera le reste
 	iowrite32(10, edu->mmio + EDU_REG_FACT);
 
-	// LE GRAND FINAL: TRANSFERT DMA
 	// On écrit un message secret dans la RAM source (vaddr_from)
 	snprintf((char *)edu->vaddr_from, 4096, "Hellooooo !!!!!");
 
-	// On vérifie que la destination est bien vide
-	pr_alert("EDU DMA: Dest AVANT le transfert = '%s'\n",
+	dev_info(dev, "DMA: Dest AVANT le transfert = '%s'\n",
 		 (char *)edu->vaddr_to);
 
 	err = edu_dma(edu, edu->dma_handle_from, EDU_DMA_BUF, 4096,
 		      EDU_DMA_START | EDU_DMA_IRQ); /* RAM → EDU */
 	if (err)
-		goto err_magic;
+		return err;
 
 	err = edu_dma(edu, EDU_DMA_BUF, edu->dma_handle_to, 4096,
 		      EDU_DMA_START | EDU_DMA_TO_RAM |
 			      EDU_DMA_IRQ); /* EDU → RAM */
 	if (err)
-		goto err_magic;
+		return err;
 
-	// LE MOMENT DE VÉRITÉ
-	pr_alert("EDU DMA: Dest APRÈS le transfert = '%s'\n",
+	dev_info(dev, "DMA: Dest APRÈS le transfert = '%s'\n",
 		 (char *)edu->vaddr_to);
 
-	return 0; // Retourner 0 signifie que l'initialisation a réussi
-err_magic:
-	edu_hw_stop(edu);
-	free_irq(dev->irq, edu);
-	pci_clear_master(dev);
-err_irq:
-	pci_iounmap(dev, edu->mmio);
-err_iomap:
-	pci_release_regions(dev);
-err_regions:
-	dma_free_coherent(&dev->dev, 4096, edu->vaddr_to, edu->dma_handle_to);
-err_alloc_to:
-	dma_free_coherent(&dev->dev, 4096, edu->vaddr_from,
-			  edu->dma_handle_from);
-err_alloc_from:
-	pci_disable_device(dev);
-	return err;
+	return 0;
 }
 
-static void edu_remove(struct pci_dev *dev)
+static void edu_remove(struct pci_dev *pdev)
 {
-	// On détruit tout, EXACTEMENT dans l'ordre inverse de la création
-	struct edu_dev *edu = pci_get_drvdata(dev);
-
-	pr_alert("Désactivation du périphérique QEMU EDU.\n");
-
-	edu_hw_stop(edu);
-	free_irq(dev->irq, edu);
-	pci_clear_master(dev);
-	pci_iounmap(dev, edu->mmio); // Détruit le pointeur virtuel
-	pci_release_regions(dev); // Retire le panneau "Propriété privée"
-	dma_free_coherent(&dev->dev, 4096, edu->vaddr_to, edu->dma_handle_to);
-	dma_free_coherent(&dev->dev, 4096, edu->vaddr_from,
-			  edu->dma_handle_from);
-	pci_disable_device(dev); // Rendort la carte
+	dev_info(&pdev->dev, "Désactivation du périphérique QEMU EDU.\n");
 }
 
 // Structure regroupant nos fonctions pour le noyau

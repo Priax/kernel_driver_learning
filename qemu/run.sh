@@ -11,6 +11,11 @@ QEMU_EXTRA=""
 KARGS=""
 AUTORUN=""
 
+# Noyau +debug: KASAN & co consomment de la RAM, et kmemleak est désactivé par défaut
+case $KVER in
+    *+debug) MEM=1G; KARGS=" kmemleak=on" ;;
+esac
+
 usage() {
     cat <<USAGE
 Usage: $0 [options]
@@ -30,7 +35,8 @@ while getopts "em:t:gk:h" opt; do
         m) MEM=$OPTARG ;;
         t) AUTORUN=$(realpath "$OPTARG") ;;
         g) QEMU_EXTRA="$QEMU_EXTRA -s -S"; KARGS="$KARGS nokaslr"
-           echo ">> gdb : gdb /usr/src/kernels/$KVER/vmlinux -ex 'target remote :1234'" ;;
+           echo ">> gdb : gdb /usr/lib/debug/lib/modules/$KVER/vmlinux -ex 'target remote :1234'"
+           echo "   (symboles : sudo dnf debuginfo-install kernel-core, ou kernel-debug-core pour +debug)" ;;
         k) KARGS="$KARGS $OPTARG" ;;
         h) usage; exit 0 ;;
         *) usage; exit 1 ;;
@@ -43,6 +49,7 @@ rm -rf "$WORK/root"
 mkdir -p "$WORK/root"/bin "$WORK/root"/proc "$WORK/root"/sys "$WORK/root"/dev "$WORK/root"/modules "$WORK/root"/tmp
 cp "$BUSYBOX" "$WORK/root/bin/busybox"
 cp "$HERE/init" "$WORK/root/init"
+cp "$HERE/tests/lib.sh" "$WORK/root/lib.sh"
 chmod +x "$WORK/root/init"
 cp "$SRC"/build/*.ko "$WORK/root/modules/" 2>/dev/null || true
 [ -d "$SRC/user" ] && cp "$SRC"/user/* "$WORK/root/bin/" 2>/dev/null || true
